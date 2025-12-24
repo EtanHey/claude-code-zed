@@ -117,15 +117,20 @@ async fn run_hybrid_server(port: Option<u16>, worktree: Option<PathBuf>) -> Resu
     let (notification_sender, notification_receiver) = tokio::sync::broadcast::channel(100);
     let notification_sender = std::sync::Arc::new(notification_sender);
 
+    // Create command channel for WebSocket -> LSP communication (bidirectional!)
+    let (command_sender, command_receiver) = tokio::sync::mpsc::channel(100);
+
     // In hybrid mode, we run both servers with notification bridge
     let websocket_handle = tokio::spawn(run_websocket_server_with_notifications(
-        port, 
-        worktree.clone(), 
-        Some(notification_receiver)
+        port,
+        worktree.clone(),
+        Some(notification_receiver),
+        Some(command_sender),
     ));
     let lsp_handle = tokio::spawn(run_lsp_server_with_notifications(
-        worktree, 
-        Some(notification_sender)
+        worktree,
+        Some(notification_sender),
+        Some(command_receiver),
     ));
 
     // Wait for either to complete (or fail)

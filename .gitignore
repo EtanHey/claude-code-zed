@@ -32,3 +32,5 @@ Thumbs.db
 # Zed extension specific
 *.wasm
 extension/
+# Claude Code instructions
+.claude/

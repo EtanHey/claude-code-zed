@@ -1,7 +1,9 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
+
+use crate::lsp::{CommandSender, LspCommand};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MCPRequest {
@@ -73,10 +75,11 @@ pub struct TextContent {
 
 pub struct MCPServer {
     capabilities: ServerCapabilities,
+    command_sender: Option<CommandSender>,
 }
 
 impl MCPServer {
-    pub fn new() -> Self {
+    pub fn new(command_sender: Option<CommandSender>) -> Self {
         let capabilities = ServerCapabilities {
             tools: Some(ToolsCapability {
                 list_changed: Some(true),
@@ -87,7 +90,10 @@ impl MCPServer {
             logging: Some(LoggingCapability {}),
         };
 
-        Self { capabilities }
+        Self {
+            capabilities,
+            command_sender,
+        }
     }
 
     pub async fn handle_request(&self, request: MCPRequest) -> Result<MCPResponse> {
@@ -202,7 +208,7 @@ impl MCPServer {
                     .get("filePath")
                     .and_then(|v| v.as_str())
                     .unwrap_or("No file path provided");
-                let preview = arguments
+                let _preview = arguments
                     .get("preview")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
@@ -212,31 +218,61 @@ impl MCPServer {
                     .get("makeFrontmost")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(true);
+                // Parse line number if provided (could be in startText like "line:42")
+                let line = arguments
+                    .get("line")
+                    .and_then(|v| v.as_u64())
+                    .map(|l| l as u32);
+                let column = arguments
+                    .get("column")
+                    .and_then(|v| v.as_u64())
+                    .map(|c| c as u32);
 
-                info!("Opening file: {} (preview: {})", file_path, preview);
+                info!("Opening file: {} (line: {:?}, take_focus: {})", file_path, line, make_frontmost);
 
-                if make_frontmost {
-                    // Simple response when making frontmost
-                    vec![TextContent {
-                        type_: "text".to_string(),
-                        text: format!("Opened file: {}", file_path),
-                    }]
-                } else {
-                    // Detailed JSON response when not making frontmost
-                    let response = serde_json::json!({
-                        "success": true,
-                        "filePath": std::path::Path::new(file_path).canonicalize()
-                            .map(|p| p.to_string_lossy().to_string())
-                            .unwrap_or_else(|_| file_path.to_string()),
-                        "languageId": "text",
-                        "lineCount": 0
-                    });
+                // Send command to LSP to open file in Zed
+                let mut opened_in_ide = false;
+                if let Some(sender) = &self.command_sender {
+                    let command = LspCommand::OpenFile {
+                        file_path: file_path.to_string(),
+                        line,
+                        column,
+                        take_focus: make_frontmost,
+                    };
 
-                    vec![TextContent {
-                        type_: "text".to_string(),
-                        text: response.to_string(),
-                    }]
+                    match sender.send(command).await {
+                        Ok(()) => {
+                            info!("Sent openFile command to LSP");
+                            opened_in_ide = true;
+                        }
+                        Err(e) => {
+                            warn!("Failed to send openFile command: {}", e);
+                        }
+                    }
                 }
+
+                // Return response
+                let canonical_path = std::path::Path::new(file_path)
+                    .canonicalize()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|_| file_path.to_string());
+
+                let response = serde_json::json!({
+                    "success": true,
+                    "filePath": canonical_path,
+                    "openedInIde": opened_in_ide,
+                    "languageId": "text",
+                    "lineCount": 0
+                });
+
+                vec![TextContent {
+                    type_: "text".to_string(),
+                    text: if make_frontmost {
+                        format!("Opened file: {}", file_path)
+                    } else {
+                        response.to_string()
+                    },
+                }]
             }
             "getCurrentSelection" => {
                 info!("Getting current selection");
@@ -476,6 +512,6 @@ impl MCPServer {
 
 impl Default for MCPServer {
     fn default() -> Self {
-        Self::new()
+        Self::new(None)
     }
 }

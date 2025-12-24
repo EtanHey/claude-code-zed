@@ -4,11 +4,12 @@ use serde_json::Value;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::broadcast;
+use std::time::Duration;
+use tokio::sync::{broadcast, mpsc, watch};
 use tower_lsp::jsonrpc::Result as LspResult;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 // Notification structures for IDE to Claude communication
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -50,11 +51,31 @@ pub struct JsonRpcNotification {
 pub type NotificationSender = broadcast::Sender<JsonRpcNotification>;
 pub type NotificationReceiver = broadcast::Receiver<JsonRpcNotification>;
 
+// Commands from WebSocket/MCP to LSP (for bidirectional communication)
+#[derive(Debug, Clone)]
+pub enum LspCommand {
+    OpenFile {
+        file_path: String,
+        line: Option<u32>,
+        column: Option<u32>,
+        take_focus: bool,
+    },
+}
+
+// Channel types for commands
+pub type CommandSender = mpsc::Sender<LspCommand>;
+pub type CommandReceiver = mpsc::Receiver<LspCommand>;
+
+// Debounce duration for selection events (ms)
+const SELECTION_DEBOUNCE_MS: u64 = 150;
+
 #[derive(Debug)]
 pub struct ClaudeCodeLanguageServer {
     client: Client,
     worktree: Option<PathBuf>,
     notification_sender: Option<Arc<NotificationSender>>,
+    /// Debounced selection sender - selection events go here first
+    selection_debouncer: Option<watch::Sender<Option<SelectionChangedNotification>>>,
 }
 
 impl ClaudeCodeLanguageServer {
@@ -63,10 +84,73 @@ impl ClaudeCodeLanguageServer {
             client,
             worktree,
             notification_sender: None,
+            selection_debouncer: None,
         }
     }
 
     pub fn with_notification_sender(mut self, sender: Arc<NotificationSender>) -> Self {
+        // Create debouncer channel
+        let (debounce_tx, mut debounce_rx) = watch::channel::<Option<SelectionChangedNotification>>(None);
+        self.selection_debouncer = Some(debounce_tx);
+
+        // Clone sender for the debounce task
+        let notification_sender = sender.clone();
+
+        // Spawn debounce task
+        tokio::spawn(async move {
+            let mut last_sent: Option<SelectionChangedNotification> = None;
+
+            loop {
+                // Wait for a change
+                if debounce_rx.changed().await.is_err() {
+                    break; // Channel closed
+                }
+
+                // Got a new selection, start debounce timer
+                loop {
+                    tokio::select! {
+                        // Wait for debounce period
+                        _ = tokio::time::sleep(Duration::from_millis(SELECTION_DEBOUNCE_MS)) => {
+                            // Debounce period passed, send the notification
+                            let current = debounce_rx.borrow().clone();
+                            if let Some(selection) = current {
+                                // Only send if different from last sent
+                                let should_send = match &last_sent {
+                                    None => true,
+                                    Some(last) => {
+                                        last.file_path != selection.file_path
+                                            || last.selection.start != selection.selection.start
+                                            || last.selection.end != selection.selection.end
+                                    }
+                                };
+
+                                if should_send {
+                                    let notification = JsonRpcNotification {
+                                        jsonrpc: "2.0".to_string(),
+                                        method: "selection_changed".to_string(),
+                                        params: serde_json::to_value(&selection).unwrap_or_default(),
+                                    };
+
+                                    if notification_sender.send(notification).is_ok() {
+                                        debug!("Sent debounced selection_changed notification");
+                                        last_sent = Some(selection);
+                                    }
+                                }
+                            }
+                            break; // Exit inner loop, wait for next change
+                        }
+                        // New selection arrived, restart debounce timer
+                        result = debounce_rx.changed() => {
+                            if result.is_err() {
+                                return; // Channel closed
+                            }
+                            // Continue loop to restart timer
+                        }
+                    }
+                }
+            }
+        });
+
         self.notification_sender = Some(sender);
         self
     }
@@ -82,6 +166,13 @@ impl ClaudeCodeLanguageServer {
             if let Err(e) = sender.send(notification) {
                 debug!("Failed to send notification: {}", e);
             }
+        }
+    }
+
+    /// Send a selection notification through the debouncer
+    fn send_selection_debounced(&self, selection: SelectionChangedNotification) {
+        if let Some(debouncer) = &self.selection_debouncer {
+            let _ = debouncer.send(Some(selection));
         }
     }
 
@@ -333,15 +424,11 @@ impl LanguageServer for ClaudeCodeLanguageServer {
             },
         };
 
-        info!(
-            "Sending selection_changed notification for range: {:?}",
+        debug!(
+            "Queueing debounced selection_changed for range: {:?}",
             params.range
         );
-        self.send_notification(
-            "selection_changed",
-            serde_json::to_value(selection_notification).unwrap(),
-        )
-        .await;
+        self.send_selection_debounced(selection_notification);
 
         let actions = vec![CodeActionOrCommand::CodeAction(CodeAction {
             title: "Explain with Claude".to_string(),
@@ -503,11 +590,7 @@ impl LanguageServer for ClaudeCodeLanguageServer {
                 },
             };
 
-            self.send_notification(
-                "selection_changed",
-                serde_json::to_value(selection_notification).unwrap(),
-            )
-            .await;
+            self.send_selection_debounced(selection_notification);
         }
 
         Ok(Some(ranges))
@@ -515,12 +598,13 @@ impl LanguageServer for ClaudeCodeLanguageServer {
 }
 
 pub async fn run_lsp_server(worktree: Option<PathBuf>) -> Result<()> {
-    run_lsp_server_with_notifications(worktree, None).await
+    run_lsp_server_with_notifications(worktree, None, None).await
 }
 
 pub async fn run_lsp_server_with_notifications(
     worktree: Option<PathBuf>,
     notification_sender: Option<Arc<NotificationSender>>,
+    command_receiver: Option<CommandReceiver>,
 ) -> Result<()> {
     info!("Starting LSP server mode");
     if let Some(path) = &worktree {
@@ -537,6 +621,45 @@ pub async fn run_lsp_server_with_notifications(
         }
         server
     });
+
+    // Spawn command handler if we have a receiver
+    // Note: This runs independently of LSP - uses zed CLI directly
+    if let Some(mut receiver) = command_receiver {
+        tokio::spawn(async move {
+            info!("Command handler ready, waiting for commands...");
+
+            while let Some(command) = receiver.recv().await {
+                match command {
+                    LspCommand::OpenFile { file_path, line, column, take_focus: _ } => {
+                        info!("Handling OpenFile command: {}", file_path);
+
+                        // Build the zed CLI argument with optional line:column
+                        let zed_arg = match (line, column) {
+                            (Some(l), Some(c)) => format!("{}:{}:{}", file_path, l, c),
+                            (Some(l), None) => format!("{}:{}", file_path, l),
+                            _ => file_path.clone(),
+                        };
+
+                        // Use zed CLI to open the file (Zed doesn't support window/showDocument)
+                        match tokio::process::Command::new("zed")
+                            .arg(&zed_arg)
+                            .spawn()
+                        {
+                            Ok(_) => {
+                                info!("Opened file via zed CLI: {}", zed_arg);
+                            }
+                            Err(e) => {
+                                error!("Failed to open file via zed CLI: {}", e);
+                            }
+                        }
+                    }
+                }
+            }
+
+            info!("Command handler shutting down");
+        });
+    }
+
     Server::new(stdin, stdout, socket).serve(service).await;
 
     Ok(())

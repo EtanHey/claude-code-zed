@@ -17,7 +17,7 @@ use tokio_tungstenite::{
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use crate::lsp::NotificationReceiver;
+use crate::lsp::{CommandSender, NotificationReceiver};
 use crate::mcp::{MCPRequest, MCPResponse, MCPServer};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -40,13 +40,14 @@ pub async fn run_websocket_server_with_worktree(
     port: Option<u16>,
     worktree: Option<PathBuf>,
 ) -> Result<()> {
-    run_websocket_server_with_notifications(port, worktree, None).await
+    run_websocket_server_with_notifications(port, worktree, None, None).await
 }
 
 pub async fn run_websocket_server_with_notifications(
     port: Option<u16>,
     worktree: Option<PathBuf>,
     mut notification_receiver: Option<NotificationReceiver>,
+    command_sender: Option<CommandSender>,
 ) -> Result<()> {
     info!("Starting WebSocket server...");
 
@@ -111,11 +112,13 @@ pub async fn run_websocket_server_with_notifications(
         } else {
             None
         };
+        let command_sender_clone = command_sender.clone();
         tokio::spawn(handle_connection(
             stream,
             peer_addr,
             auth_token_clone,
             notification_receiver_clone,
+            command_sender_clone,
         ));
     }
 
@@ -180,6 +183,7 @@ async fn handle_connection(
     peer_addr: SocketAddr,
     auth_token: String,
     notification_receiver: Option<NotificationReceiver>,
+    command_sender: Option<CommandSender>,
 ) -> Result<()> {
     info!("Handling connection from {}", peer_addr);
 
@@ -210,7 +214,7 @@ async fn handle_connection(
         }
     };
 
-    handle_websocket_connection(ws_stream, peer_addr, auth_token, notification_receiver).await
+    handle_websocket_connection(ws_stream, peer_addr, auth_token, notification_receiver, command_sender).await
 }
 
 async fn handle_websocket_connection(
@@ -218,9 +222,10 @@ async fn handle_websocket_connection(
     peer_addr: SocketAddr,
     _auth_token: String,
     mut notification_receiver: Option<NotificationReceiver>,
+    command_sender: Option<CommandSender>,
 ) -> Result<()> {
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
-    let mcp_handler = MCPServer::new();
+    let mcp_handler = MCPServer::new(command_sender);
 
     info!("WebSocket connection established with {}", peer_addr);
 
